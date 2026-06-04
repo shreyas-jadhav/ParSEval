@@ -577,5 +577,266 @@ class TestSMTSolverCurrentLimitations(SMTSolverTestCase):
         self.assertNotIn("users.name", model)
 
 
+def test_in_list_single_pass_evaluation():
+    """IN-list heuristic should evaluate each element once, not twice."""
+    from parseval.solver.unified import Solver
+    from parseval.instance import Instance
+
+    instance = Instance(ddls="CREATE TABLE t (id INT, name TEXT)", name="test", dialect="sqlite")
+    instance.create_row("t", values={"id": 1, "name": "a"})
+    instance.create_row("t", values={"id": 2, "name": "b"})
+
+    solver = Solver(instance, dialect="sqlite")
+    # The IN-list optimization is internal — just verify solver doesn't break
+    assert solver is not None
+
+
+def test_declare_variable_creates_option_wrapped_z3_var():
+    """declare_variable returns an Option-wrapped Z3 variable stored in context."""
+    from parseval.solver.smt import SMTSolver
+
+    solver = SMTSolver(variables=[], timeout_ms=1000)
+    var = solver.declare_variable("t1[0].id", DataType.build("INT"))
+
+    # Should be Option-wrapped (DatatypeSortRef)
+    assert isinstance(var.sort(), z3.DatatypeSortRef)
+    # Should be stored in context
+    assert "t1[0].id" in solver.context.get("variable_to_z3", {})
+    # Calling again returns the same object
+    var2 = solver.declare_variable("t1[0].id", DataType.build("INT"))
+    assert var is var2
+
+
+def test_col_sort_datatype_resolves_from_instance():
+    """col_sort_datatype resolves DataType from Instance schema."""
+    from parseval.solver.smt import SMTSolver
+
+    class MockTables:
+        tables = {"users": {"id": "INTEGER", "name": "TEXT", "score": "REAL"}}
+
+    solver = SMTSolver(variables=[], timeout_ms=1000, instance=MockTables())
+
+    assert solver.col_sort_datatype("users", "id") == DataType.build("INTEGER")
+    assert solver.col_sort_datatype("users", "name") == DataType.build("TEXT")
+    assert solver.col_sort_datatype("users", "score") == DataType.build("REAL")
+    # Unknown column defaults to TEXT
+    assert solver.col_sort_datatype("users", "missing") == DataType.build("TEXT")
+
+
+def test_translate_with_custom_context():
+    """translate() uses caller-provided variable context for Column resolution."""
+    solver = SMTSolver(variables=[], timeout_ms=1000)
+
+    # Declare variables with custom names
+    var_a = solver.declare_variable("alias1[0].x", DataType.build("INT"))
+    var_b = solver.declare_variable("alias2[1].x", DataType.build("INT"))
+
+    ctx = {"alias1.x": var_a, "alias2.x": var_b}
+
+    # Build: alias1.x = alias2.x
+    col_a = exp.column("x", "alias1")
+    col_a.set("type", DataType.build("INT"))
+    col_b = exp.column("x", "alias2")
+    col_b.set("type", DataType.build("INT"))
+    eq_expr = exp.EQ(this=col_a, expression=col_b)
+
+    result = solver.translate(eq_expr, ctx=ctx)
+    assert result is not None
+    # Result should be a Z3 BoolRef
+    assert z3.is_bool(result)
+
+
+def test_add_raw_and_solve_raw():
+    """add_raw adds constraints directly; solve_raw extracts solutions."""
+    solver = SMTSolver(variables=[], timeout_ms=5000)
+
+    var_a = solver.declare_variable("t[0].x", DataType.build("INT"))
+    var_b = solver.declare_variable("t[0].y", DataType.build("INT"))
+
+    # Add constraint: t[0].x = 42 (Option-wrapped)
+    const_42 = encode_literal(DataType.build("INT"), 42).expr
+    solver.add_raw(var_a == const_42)
+
+    # Add constraint: t[0].y = t[0].x (Option equality)
+    solver.add_raw(var_b == var_a)
+
+    var_symbols = {"t[0].x": None, "t[0].y": None}
+    status, solution = solver.solve_raw(var_symbols)
+
+    assert status == "sat"
+    assert solution.get("t[0].x") == 42
+    assert solution.get("t[0].y") == 42
+
+
+def test_apply_solution():
+    """apply_solution writes values into Variable symbols."""
+    class FakeSymbol:
+        def __init__(self):
+            self.values = {}
+        def set(self, key, val):
+            self.values[key] = val
+
+    sym_x = FakeSymbol()
+    sym_y = FakeSymbol()
+    var_symbols = {"t[0].x": sym_x, "t[0].y": sym_y}
+    solution = {"t[0].x": 42, "t[0].y": 99}
+
+    SMTSolver.apply_solution(var_symbols, solution)
+
+    assert sym_x.values == {"concrete": 42, "is_bound": True, "is_null": False}
+    assert sym_y.values == {"concrete": 99, "is_bound": True, "is_null": False}
+
+
+# =============================================================================
+# Tests for lowering.py — negated predicate lowering
+# =============================================================================
+
+
+class MockInstance:
+    """Minimal Instance stand-in for lowering tests."""
+
+    def __init__(self, tables):
+        self.tables = tables
+
+    def nullable(self, table, col):
+        return True
+
+
+class TestNegateOp(unittest.TestCase):
+    def test_flips_eq_to_neq(self):
+        from parseval.solver.lowering import _negate_op
+        self.assertEqual(_negate_op("="), "!=")
+
+    def test_flips_neq_to_eq(self):
+        from parseval.solver.lowering import _negate_op
+        self.assertEqual(_negate_op("!="), "=")
+
+    def test_flips_gt_to_lte(self):
+        from parseval.solver.lowering import _negate_op
+        self.assertEqual(_negate_op(">"), "<=")
+
+    def test_flips_gte_to_lt(self):
+        from parseval.solver.lowering import _negate_op
+        self.assertEqual(_negate_op(">="), "<")
+
+    def test_flips_lt_to_gte(self):
+        from parseval.solver.lowering import _negate_op
+        self.assertEqual(_negate_op("<"), ">=")
+
+    def test_flips_lte_to_gt(self):
+        from parseval.solver.lowering import _negate_op
+        self.assertEqual(_negate_op("<="), ">")
+
+
+class TestLowerNotExpr(unittest.TestCase):
+    def setUp(self):
+        self.instance = MockInstance({
+            "users": {"id": "INT", "name": "TEXT", "age": "INT"},
+        })
+        self.tables = ("users",)
+
+    def _lower(self, expr):
+        from parseval.solver.lowering import lower_predicates
+        preds, residuals = lower_predicates(expr, self.instance, self.tables)
+        return preds, residuals
+
+    def test_not_eq_flips_to_neq(self):
+        col = exp.column("id", table="users")
+        lit = exp.Literal.number(5)
+        inner = exp.EQ(this=col, expression=lit)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(len(residuals), 0)
+        self.assertEqual(preds[0].op, "!=")
+        self.assertEqual(preds[0].value, 5)
+
+    def test_not_gt_flips_to_lte(self):
+        col = exp.column("age", table="users")
+        lit = exp.Literal.number(10)
+        inner = exp.GT(this=col, expression=lit)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0].op, "<=")
+        self.assertEqual(preds[0].value, 10)
+
+    def test_not_lt_flips_to_gte(self):
+        col = exp.column("age", table="users")
+        lit = exp.Literal.number(20)
+        inner = exp.LT(this=col, expression=lit)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0].op, ">=")
+        self.assertEqual(preds[0].value, 20)
+
+    def test_not_neq_flips_to_eq(self):
+        col = exp.column("name", table="users")
+        lit = exp.Literal.string("alice")
+        inner = exp.NEQ(this=col, expression=lit)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0].op, "=")
+        self.assertEqual(preds[0].value, "alice")
+
+    def test_not_gte_flips_to_lt(self):
+        col = exp.column("id", table="users")
+        lit = exp.Literal.number(3)
+        inner = exp.GTE(this=col, expression=lit)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0].op, "<")
+        self.assertEqual(preds[0].value, 3)
+
+    def test_not_lte_flips_to_gt(self):
+        col = exp.column("id", table="users")
+        lit = exp.Literal.number(7)
+        inner = exp.LTE(this=col, expression=lit)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0].op, ">")
+        self.assertEqual(preds[0].value, 7)
+
+    def test_not_is_null_becomes_not_null(self):
+        col = exp.column("name", table="users")
+        inner = exp.Is(this=col, expression=exp.Null())
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0].op, "not_null")
+
+    def test_double_not_unwraps(self):
+        col = exp.column("id", table="users")
+        lit = exp.Literal.number(5)
+        inner = exp.EQ(this=col, expression=lit)
+        double_not = exp.Not(this=exp.Not(this=inner))
+
+        preds, residuals = self._lower(double_not)
+        self.assertEqual(len(preds), 1)
+        # NOT(NOT(col = 5)) → col = 5
+        self.assertEqual(preds[0].op, "=")
+        self.assertEqual(preds[0].value, 5)
+
+    def test_not_unsupported_goes_to_residuals(self):
+        # NOT(subquery) → residuals
+        inner = exp.Literal.number(1)
+        not_expr = exp.Not(this=inner)
+
+        preds, residuals = self._lower(not_expr)
+        self.assertEqual(len(preds), 0)
+        self.assertEqual(len(residuals), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

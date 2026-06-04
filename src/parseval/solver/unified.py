@@ -1,481 +1,76 @@
 """Unified constraint solver for ParSEval.
 
-The solver provides a single interface that the symbolic engine calls to
-satisfy branch constraints. Internally it uses a tiered resolution
-strategy:
+The solver provides a single interface to satisfy constraints expressed as
+sqlglot AST nodes. Internally it uses a two-tier resolution strategy:
 
-* **Tier 0 — Trivial**: direct value assignment from literals, IS NULL,
-  equality with a constant. No computation needed.
-* **Tier 1 — Heuristic**: range constraints (``a > 5`` → pick 6),
-  LIKE patterns (generate a matching string), BETWEEN, IN-list membership.
-  Cheap Python logic, no SMT.
-* **Tier 2 — SMT**: compound constraints with cross-column dependencies,
-  arithmetic relationships, or anything Tiers 0–1 can't handle. Delegates
-  to Z3 via the existing :mod:`parseval.solver.smt` translation layer.
+* **Domain solver**: CSP-lite value-space narrowing with constraint
+  propagation. It returns a tri-state result: ``sat`` when it handled the
+  full formula, ``unsat`` when it proved a contradiction, and ``unknown``
+  when the formula is outside its supported fragment.
+* **SMT fallback**: Full Z3-backed constraint solving for complex
+  constraints with cross-column dependencies or arithmetic relationships.
+  It runs only for domain ``unknown`` and fails closed if any input
+  expression cannot be translated.
 
-Type handling is delegated to the domain module's :class:`TypeService` +
-:class:`TypeProfile` + :func:`coerce_value`. The solver generates values
-in the right family and coerces them through the domain's adapter layer
-before returning, so all values are guaranteed to be instance-consistent
-and database-writable.
+The solver is a pure function of its inputs — it does not depend on
+``Instance`` or any database state.  The caller is responsible for
+annotating ``exp.Column.type`` on every column node in the constraint
+expressions so the solver can resolve datatypes for Z3 encoding and
+CSP value generation.
 """
 
 from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlglot import exp
 
-from parseval.domain.coercion import coerce_value
-from parseval.domain.types import TypeFamily, TypeProfile, TypeService
 from parseval.dtype import DataType
-from parseval.instance import Instance
-from parseval.plan.rex import Environment, concrete, negate_predicate
-from parseval.symbolic.constraints import SolverConstraint
-from parseval.symbolic.types import BranchType
+from parseval.helper import normalize_name
+
+from .types import col_type
 
 
 # =============================================================================
-# Result types
+# Public types
 # =============================================================================
 
 
 @dataclass
+class SolverConstraint:
+    """Constraints for the solver to satisfy.
+
+    Every ``exp.Column`` node inside *constraints* must have its ``.type``
+    attribute set to a valid ``exp.DataType`` (e.g.
+    ``exp.DataType.build("INT")``).  The solver reads types from these
+    annotations — it does not consult any external schema.
+
+    Attributes:
+        target_tables: Tables the solver should generate values for.
+        constraints: All constraint expressions (comparisons, IS NULL, etc.).
+        join_equalities: Cross-table equalities ``(left_table, left_col,
+            right_table, right_col)`` that the solver enforces.
+        alias_map: Table alias → real name mapping for column resolution.
+    """
+
+    target_tables: Tuple[str, ...]
+    constraints: List[exp.Expression] = field(default_factory=list)
+    join_equalities: List[Tuple[str, str, str, str]] = field(default_factory=list)
+    alias_map: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class SolveResult:
-    """Outcome of a solver invocation."""
+    """Outcome of a solver invocation.
+
+    Assignments use ``"table.column"`` keys mapping to concrete Python values.
+    """
 
     sat: bool
-    assignments: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    # table_name → {column_name → value}
+    assignments: Dict[str, Any] = field(default_factory=dict)
     reason: str = ""
-
-
-# =============================================================================
-# Tier 0 — Trivial resolution
-# =============================================================================
-
-
-def _try_trivial(
-    atom: exp.Expression,
-    target_outcome: BranchType,
-    tables: Tuple[str, ...],
-    instance: Instance,
-) -> Optional[Dict[str, Dict[str, Any]]]:
-    """Try to satisfy the constraint with a direct value assignment.
-
-    Handles:
-    - ``col = literal`` (ATOM_TRUE → assign literal; ATOM_FALSE → assign different)
-    - ``col IS NULL`` (ATOM_TRUE → assign NULL)
-    - ``col IS NOT NULL`` (ATOM_TRUE → assign any non-NULL)
-    - ATOM_NULL target → assign NULL to one column in the atom
-    """
-    if target_outcome == BranchType.ATOM_NULL:
-        # Make the atom evaluate to NULL by NULLing a column.
-        columns = list(atom.find_all(exp.Column))
-        for col in columns:
-            table = _resolve_table(col, tables, instance)
-            if table and instance.nullable(table, col.name):
-                return {table: {col.name: None}}
-        return None
-
-    # EQ: col = literal
-    if isinstance(atom, exp.EQ):
-        col, lit = _extract_column_literal(atom)
-        if col is not None and lit is not None:
-            table = _resolve_table(col, tables, instance)
-            if target_outcome == BranchType.ATOM_TRUE:
-                return {table: {col.name: lit}}
-            else:  # ATOM_FALSE
-                return {table: {col.name: _different_value(lit, instance, table, col.name)}}
-
-    # NEQ: col <> literal
-    if isinstance(atom, exp.NEQ):
-        col, lit = _extract_column_literal(atom)
-        if col is not None and lit is not None:
-            table = _resolve_table(col, tables, instance)
-            if target_outcome == BranchType.ATOM_TRUE:
-                return {table: {col.name: _different_value(lit, instance, table, col.name)}}
-            else:  # ATOM_FALSE → make them equal
-                return {table: {col.name: lit}}
-
-    # IS NULL / IS NOT NULL
-    if isinstance(atom, exp.Is):
-        left = atom.this
-        right = atom.expression
-        if isinstance(left, exp.Column) and isinstance(right, exp.Null):
-            table = _resolve_table(left, tables, instance)
-            if target_outcome == BranchType.ATOM_TRUE:
-                return {table: {left.name: None}}
-            else:
-                return {table: {left.name: _non_null_value(instance, table, left.name)}}
-
-    return None
-
-
-def _extract_column_literal(
-    node: exp.Expression,
-) -> Tuple[Optional[exp.Column], Optional[Any]]:
-    """Extract (column, python_value) from a binary comparison if one side is a literal."""
-    left, right = node.this, node.expression
-    if isinstance(left, exp.Column) and _is_literal(right):
-        return left, concrete(right)
-    if isinstance(right, exp.Column) and _is_literal(left):
-        return right, concrete(left)
-    return None, None
-
-
-def _is_literal(node: exp.Expression) -> bool:
-    """Check if a node is a concrete literal value."""
-    return isinstance(node, (exp.Literal, exp.Boolean, exp.Null))
-
-
-def _resolve_table(col: exp.Column, tables: Tuple[str, ...], instance: Instance) -> str:
-    """Resolve which table a column belongs to.
-
-    Handles aliases by checking the Instance's real table names and
-    falling back to column-name matching across all candidate tables.
-    """
-    from parseval.helper import normalize_name
-
-    if col.table:
-        table_name = col.table
-        # Direct match.
-        if table_name in instance.tables:
-            return table_name
-        # Normalized match.
-        normalized = normalize_name(table_name)
-        if normalized in instance.tables:
-            return normalized
-        # The table might be an alias — check if any candidate table has this column.
-        col_name = normalize_name(col.name)
-        for candidate in tables:
-            real = normalize_name(candidate)
-            if real in instance.tables and col_name in instance.tables[real]:
-                return real
-
-    # No table qualifier — find the first table that has this column.
-    col_name = normalize_name(col.name)
-    for table in tables:
-        real = normalize_name(table)
-        if real in instance.tables and col_name in instance.tables[real]:
-            return real
-    return tables[0] if tables else ""
-
-
-def _different_value(original: Any, instance: Instance, table: str, column: str) -> Any:
-    """Generate a value different from ``original``, respecting the column's type."""
-    profile = _column_profile(instance, table, column)
-    if profile is None:
-        # Fallback without type info.
-        if isinstance(original, int):
-            return original + 1
-        if isinstance(original, float):
-            return original + 1.0
-        if isinstance(original, str):
-            return original + "_diff"
-        if isinstance(original, bool):
-            return not original
-        return 0
-
-    family = profile.family
-    if family == TypeFamily.INTEGER:
-        return (int(original) if original is not None else 0) + 1
-    if family == TypeFamily.DECIMAL:
-        return (float(original) if original is not None else 0.0) + 1.0
-    if family == TypeFamily.TEXT:
-        return (str(original) if original is not None else "") + "_diff"
-    if family == TypeFamily.BOOLEAN:
-        return not bool(original)
-    if family == TypeFamily.DATE:
-        base = original if isinstance(original, date) else date(2024, 1, 1)
-        return base + timedelta(days=1)
-    if family == TypeFamily.DATETIME:
-        base = original if isinstance(original, datetime) else datetime(2024, 1, 1)
-        return base + timedelta(hours=1)
-    return 0
-
-
-def _non_null_value(instance: Instance, table: str, column: str) -> Any:
-    """Generate a non-NULL value appropriate for the column's type."""
-    # Check existing values for a hint.
-    existing = instance.get_column_data(table, column)
-    for sym in existing:
-        if sym.concrete is not None:
-            return sym.concrete
-
-    profile = _column_profile(instance, table, column)
-    if profile is None:
-        return "value"
-
-    return _default_for_family(profile)
-
-
-def _default_for_family(profile: TypeProfile) -> Any:
-    """Generate a sensible default value for a type family."""
-    family = profile.family
-    if family == TypeFamily.INTEGER:
-        return 1
-    if family == TypeFamily.DECIMAL:
-        return 1.0
-    if family == TypeFamily.TEXT:
-        length = profile.length or 10
-        return "a" * min(length, 5)
-    if family == TypeFamily.BOOLEAN:
-        return True
-    if family == TypeFamily.DATE:
-        return date(2024, 1, 15)
-    if family == TypeFamily.DATETIME:
-        return datetime(2024, 1, 15, 12, 0, 0)
-    if family == TypeFamily.TIME:
-        return time(12, 0, 0)
-    if family == TypeFamily.UUID:
-        import uuid
-        return uuid.uuid4()
-    return "value"
-
-
-def _column_profile(instance: Instance, table: str, column: str) -> Optional[TypeProfile]:
-    """Resolve the TypeProfile for a column, or None if unavailable."""
-    try:
-        table_spec = instance.schema_spec.get_table(table)
-        col_spec = table_spec.get_column(column)
-        return TypeService().profile(col_spec)
-    except (KeyError, Exception):
-        return None
-
-
-# =============================================================================
-# Tier 1 — Heuristic resolution
-# =============================================================================
-
-
-def _try_heuristic(
-    atom: exp.Expression,
-    target_outcome: BranchType,
-    tables: Tuple[str, ...],
-    instance: Instance,
-) -> Optional[Dict[str, Dict[str, Any]]]:
-    """Try to satisfy the constraint with simple heuristic logic.
-
-    Handles:
-    - ``col > N`` / ``col >= N`` / ``col < N`` / ``col <= N``
-    - ``col BETWEEN low AND high``
-    - ``col LIKE pattern``
-    - ``col IN (v1, v2, ...)``
-    """
-    if target_outcome == BranchType.ATOM_NULL:
-        return None  # Tier 0 handles NULL targets
-
-    # GT: col > N
-    if isinstance(atom, exp.GT):
-        col, lit = _extract_column_literal(atom)
-        if col is not None and lit is not None and isinstance(lit, (int, float)):
-            table = _resolve_table(col, tables, instance)
-            if target_outcome == BranchType.ATOM_TRUE:
-                return {table: {col.name: lit + 1}}
-            else:
-                return {table: {col.name: lit - 1}}
-
-    # GTE: col >= N
-    if isinstance(atom, exp.GTE):
-        col, lit = _extract_column_literal(atom)
-        if col is not None and lit is not None and isinstance(lit, (int, float)):
-            table = _resolve_table(col, tables, instance)
-            if target_outcome == BranchType.ATOM_TRUE:
-                return {table: {col.name: lit}}
-            else:
-                return {table: {col.name: lit - 1}}
-
-    # LT: col < N
-    if isinstance(atom, exp.LT):
-        col, lit = _extract_column_literal(atom)
-        if col is not None and lit is not None and isinstance(lit, (int, float)):
-            table = _resolve_table(col, tables, instance)
-            if target_outcome == BranchType.ATOM_TRUE:
-                return {table: {col.name: lit - 1}}
-            else:
-                return {table: {col.name: lit + 1}}
-
-    # LTE: col <= N
-    if isinstance(atom, exp.LTE):
-        col, lit = _extract_column_literal(atom)
-        if col is not None and lit is not None and isinstance(lit, (int, float)):
-            table = _resolve_table(col, tables, instance)
-            if target_outcome == BranchType.ATOM_TRUE:
-                return {table: {col.name: lit}}
-            else:
-                return {table: {col.name: lit + 1}}
-
-    # BETWEEN
-    if isinstance(atom, exp.Between):
-        col = atom.this
-        if isinstance(col, exp.Column):
-            low = concrete(atom.args.get("low"))
-            high = concrete(atom.args.get("high"))
-            if low is not None and high is not None:
-                table = _resolve_table(col, tables, instance)
-                if target_outcome == BranchType.ATOM_TRUE:
-                    mid = (low + high) // 2 if isinstance(low, int) else (low + high) / 2
-                    return {table: {col.name: mid}}
-                else:
-                    return {table: {col.name: high + 1 if isinstance(high, int) else high + 1.0}}
-
-    # LIKE
-    if isinstance(atom, exp.Like):
-        col = atom.this
-        pattern_node = atom.expression
-        if isinstance(col, exp.Column) and isinstance(pattern_node, exp.Literal):
-            table = _resolve_table(col, tables, instance)
-            pattern = pattern_node.this
-            if target_outcome == BranchType.ATOM_TRUE:
-                # Generate a string matching the pattern.
-                value = _generate_like_match(pattern)
-                return {table: {col.name: value}}
-            else:
-                return {table: {col.name: "__no_match__"}}
-
-    # IN (literal list)
-    if isinstance(atom, exp.In):
-        col = atom.this
-        expressions = atom.args.get("expressions") or []
-        if isinstance(col, exp.Column) and expressions:
-            table = _resolve_table(col, tables, instance)
-            values = [concrete(e) for e in expressions if concrete(e) is not None]
-            if target_outcome == BranchType.ATOM_TRUE and values:
-                return {table: {col.name: values[0]}}
-            elif target_outcome == BranchType.ATOM_FALSE:
-                avoid = set(values)
-                candidate = _value_not_in(avoid)
-                return {table: {col.name: candidate}}
-
-    return None
-
-
-def _generate_like_match(pattern: str) -> str:
-    """Generate a string that matches a SQL LIKE pattern."""
-    result = []
-    i = 0
-    while i < len(pattern):
-        ch = pattern[i]
-        if ch == "%":
-            result.append("x")
-        elif ch == "_":
-            result.append("a")
-        else:
-            result.append(ch)
-        i += 1
-    return "".join(result)
-
-
-def _value_not_in(avoid: Set[Any]) -> Any:
-    """Generate a value not in the avoid set."""
-    if all(isinstance(v, int) for v in avoid):
-        candidate = max(avoid) + 1 if avoid else 0
-        return candidate
-    if all(isinstance(v, str) for v in avoid):
-        return "__not_in_list__"
-    return 99999
-
-
-# =============================================================================
-# Tier 2 — SMT resolution
-# =============================================================================
-
-
-def _try_smt(
-    constraint: SolverConstraint,
-    instance: Instance,
-    dialect: str,
-    timeout_ms: int = 5000,
-) -> Optional[Dict[str, Dict[str, Any]]]:
-    """Delegate to Z3 for complex constraints.
-
-    Translates the atom expression + path predicates into Z3 constraints
-    using the SMTSolver's sqlglot-to-Z3 translation layer.
-    """
-    try:
-        from .smt import SMTSolver, UnsupportedSMTError
-        from parseval.helper import normalize_name
-
-        # Collect all columns referenced in the constraint and annotate types
-        all_exprs = [constraint.atom] + list(constraint.path_predicates)
-        columns = []
-        for expr in all_exprs:
-            for col in expr.find_all(exp.Column):
-                # Ensure column has type annotation
-                if col.type is None or str(col.type) in ("", "UNKNOWN"):
-                    table_name = normalize_name(col.table or "")
-                    if table_name not in instance.tables:
-                        for t in constraint.target_tables:
-                            real_t = normalize_name(t)
-                            if real_t in instance.tables and normalize_name(col.name) in instance.tables[real_t]:
-                                table_name = real_t
-                                col.set("table", exp.to_identifier(real_t))
-                                break
-                    if table_name in instance.tables:
-                        col_name = normalize_name(col.name)
-                        if col_name in instance.tables[table_name]:
-                            try:
-                                col.type = exp.DataType.build(str(instance.tables[table_name][col_name]))
-                            except Exception:
-                                col.type = exp.DataType.build("TEXT")
-                columns.append(col)
-
-        solver = SMTSolver(variables=columns, timeout_ms=timeout_ms)
-
-        # Translate and add the target atom
-        try:
-            z3_atom = solver._to_z3_expr(constraint.atom)
-            solver.add(z3_atom)
-        except (UnsupportedSMTError, Exception):
-            return None
-
-        # Add path predicates
-        for pred in constraint.path_predicates:
-            try:
-                z3_pred = solver._to_z3_expr(pred)
-                solver.add(z3_pred)
-            except Exception:
-                pass
-
-        # Add join equalities
-        for lt, lc, rt, rc in constraint.join_equalities:
-            try:
-                left_col = exp.column(lc, lt)
-                right_col = exp.column(rc, rt)
-                # Annotate types
-                lt_real = normalize_name(lt)
-                rt_real = normalize_name(rt)
-                if lt_real in instance.tables and normalize_name(lc) in instance.tables[lt_real]:
-                    left_col.type = exp.DataType.build(str(instance.tables[lt_real][normalize_name(lc)]))
-                if rt_real in instance.tables and normalize_name(rc) in instance.tables[rt_real]:
-                    right_col.type = exp.DataType.build(str(instance.tables[rt_real][normalize_name(rc)]))
-                eq_expr = exp.EQ(this=left_col, expression=right_col)
-                z3_eq = solver._to_z3_expr(eq_expr)
-                solver.add(z3_eq)
-            except Exception:
-                pass
-
-        status, solutions = solver.solve()
-        if status != "sat" or not solutions:
-            return None
-
-        # Group assignments by table
-        assignments: Dict[str, Dict[str, Any]] = {}
-        for var_name, value in solutions.items():
-            parts = var_name.split(".")
-            if len(parts) == 2:
-                table, col = parts
-            else:
-                table = constraint.target_tables[0] if constraint.target_tables else ""
-                col = var_name
-            assignments.setdefault(table, {})[col] = value
-        return assignments if assignments else None
-    except Exception:
-        return None
 
 
 # =============================================================================
@@ -483,220 +78,429 @@ def _try_smt(
 # =============================================================================
 
 
+def _year_extractor_inner_column(expr: exp.Expression) -> Optional[exp.Column]:
+    """Return the inner column of a year-extractor call, or None.
+
+    Recognises:
+    * ``STRFTIME('%Y', col)`` (SQLite, with optional ``TsOrDs*`` wrap)
+    * ``YEAR(col)`` (MySQL/PostgreSQL, with optional ``TsOrDs*`` wrap)
+    * ``EXTRACT(YEAR FROM col)`` (standard SQL, PG, MySQL 8+)
+    """
+    if isinstance(expr, exp.TimeToStr):
+        if not isinstance(expr.args.get("format"), exp.Literal):
+            return None
+        if expr.args["format"].this != "%Y":
+            return None
+        inner = expr.this
+        if isinstance(inner, exp.TsOrDsToTimestamp):
+            inner = inner.this
+        return inner if isinstance(inner, exp.Column) else None
+    if isinstance(expr, exp.Year):
+        inner = expr.this
+        if isinstance(inner, exp.TsOrDsToDate):
+            inner = inner.this
+        return inner if isinstance(inner, exp.Column) else None
+    if isinstance(expr, exp.Extract):
+        unit_node = expr.this
+        unit_text = None
+        if isinstance(unit_node, exp.Var):
+            unit_text = unit_node.name.upper()
+        elif isinstance(unit_node, exp.Identifier):
+            unit_text = unit_node.name.upper()
+        elif isinstance(unit_node, exp.Column):
+            unit_text = unit_node.name.upper()
+        if unit_text != "YEAR":
+            return None
+        inner = expr.expression
+        return inner if isinstance(inner, exp.Column) else None
+    return None
+
+
+def _rewrite_year_extractor_predicates(constraint: SolverConstraint) -> None:
+    """Replace ``YEAR(col) op year`` with equivalent column bounds.
+
+    Handles ``STRFTIME('%Y', col)``, ``YEAR(col)``, and
+    ``EXTRACT(YEAR FROM col)``. For DATE / TIMESTAMP columns the year
+    comparison is monotone, so the original predicate is equivalent to
+    ``col >= epoch(date(Y_lo, 1, 1)) AND col <= epoch(date(Y_hi, 12, 31))``.
+    This sidesteps Z3 having to invert the Hinnant year decomposition
+    (a deep non-linear integer formula that is intractable for the
+    default solver strategy within the 5s timeout).
+
+    Mutates ``constraint.constraints`` in place.
+    """
+    from datetime import date as _date, datetime as _dt
+    from .smt_types import date_to_epoch_day, datetime_to_epoch_second
+
+    rewritten: List[exp.Expression] = []
+    for cexpr in constraint.constraints:
+        # Find every (year-extractor → comparison-node → column) pattern.
+        targets: List[Tuple[exp.Expression, exp.Column, int, Optional[int]]] = []
+        for kind in (exp.TimeToStr, exp.Year, exp.Extract):
+            for node in cexpr.find_all(kind):
+                col = _year_extractor_inner_column(node)
+                if col is None:
+                    continue
+                cmp_node = node
+                while cmp_node is not None and not isinstance(
+                    cmp_node, (exp.EQ, exp.GTE, exp.LTE, exp.Between)
+                ):
+                    cmp_node = cmp_node.parent
+                if cmp_node is None:
+                    continue
+                year_lits = [
+                    a for a in cmp_node.args.values()
+                    if isinstance(a, exp.Literal)
+                ]
+                years: List[int] = []
+                for lit in year_lits:
+                    raw = lit.this
+                    if not isinstance(raw, str):
+                        raw = str(raw)
+                    if len(raw) == 4 and raw.isdigit():
+                        years.append(int(raw))
+                if not years:
+                    continue
+                if isinstance(cmp_node, exp.EQ):
+                    lo_year, hi_year = years[0], years[0]
+                elif isinstance(cmp_node, exp.GTE):
+                    lo_year, hi_year = years[0], None
+                elif isinstance(cmp_node, exp.LTE):
+                    lo_year, hi_year = None, years[0]
+                else:
+                    lo_year, hi_year = min(years), max(years)
+                dtype = col_type(col) or DataType.build("TEXT")
+                is_date = dtype.is_type(DataType.Type.DATE) or dtype.is_type(
+                    DataType.Type.DATE32
+                )
+                is_datetime = dtype.is_type(
+                    DataType.Type.TIMESTAMP, DataType.Type.TIMESTAMP_S,
+                    DataType.Type.TIMESTAMP_MS, DataType.Type.TIMESTAMP_NS,
+                    DataType.Type.TIMESTAMPTZ, DataType.Type.TIMESTAMPLTZ,
+                    DataType.Type.DATETIME, DataType.Type.DATETIME64,
+                )
+                if not (is_date or is_datetime):
+                    continue
+                targets.append((cmp_node, col, lo_year, hi_year))
+
+        if not targets:
+            rewritten.append(cexpr)
+            continue
+
+        new_expr = cexpr.copy()
+        for old_node, col, lo_year, hi_year in targets:
+            dtype = col_type(col) or DataType.build("TEXT")
+            is_date = dtype.is_type(DataType.Type.DATE) or dtype.is_type(
+                DataType.Type.DATE32
+            )
+            new_preds: List[exp.Expression] = []
+            if lo_year is not None:
+                if is_date:
+                    payload = date_to_epoch_day(_date(lo_year, 1, 1))
+                else:
+                    payload = datetime_to_epoch_second(_dt(lo_year, 1, 1))
+                new_preds.append(exp.GTE(
+                    this=col.copy(), expression=exp.Literal.number(payload),
+                ))
+            if hi_year is not None:
+                if is_date:
+                    payload = date_to_epoch_day(_date(hi_year, 12, 31))
+                else:
+                    payload = datetime_to_epoch_second(
+                        _dt(hi_year, 12, 31, 23, 59, 59)
+                    )
+                new_preds.append(exp.LTE(
+                    this=col.copy(), expression=exp.Literal.number(payload),
+                ))
+
+            new_target = _find_replica(new_expr, old_node)
+            if new_target is None:
+                continue
+            parent = new_target.parent
+            if parent is None:
+                new_expr = new_preds[0] if len(new_preds) == 1 else exp.and_(*new_preds)
+                break
+            for k, v in list(parent.args.items()):
+                if v is new_target:
+                    parent.set(k, new_preds[0] if len(new_preds) == 1
+                               else exp.and_(*new_preds))
+                    break
+        rewritten.append(new_expr)
+    constraint.constraints = rewritten
+
+
+def _find_replica(root: exp.Expression, target: exp.Expression) -> Optional[exp.Expression]:
+    """Locate the node in ``root`` that is structurally identical to ``target``.
+
+    Used after ``root = target.copy()`` to find the matching node when we
+    no longer have identity-based references.
+    """
+    for candidate in root.walk():
+        if type(candidate) is type(target) and candidate.sql() == target.sql():
+            return candidate
+    return None
+
+
+def narrow_year_bounds(constraint: SolverConstraint) -> None:
+    """In-place: rewrite year-extractor predicates into date bounds.
+
+    See :func:`_rewrite_year_extractor_predicates` for the rationale.
+    """
+    _rewrite_year_extractor_predicates(constraint)
+
+
 class Solver:
     """Unified constraint solver with tiered resolution.
 
-    Tries cheap resolution first (trivial assignment, heuristic), then
-    escalates to SMT only when needed. Always respects schema constraints
-    (NOT NULL, UNIQUE, FK).
+    Tries cheap resolution first (domain / CSP-lite), then escalates to
+    SMT (Z3) only when needed.  The solver is a pure function of its
+    inputs — no ``Instance`` dependency.
     """
 
     def __init__(
         self,
-        instance: Instance,
         dialect: str = "sqlite",
         *,
         timeout_ms: int = 5000,
         seed: int = 42,
     ):
-        """Initialize the unified constraint solver.
-
-        Args:
-            instance: The database instance with schema and existing row data.
-            dialect: SQL dialect for type-aware generation (default "sqlite").
-            timeout_ms: Timeout for SMT solver queries in milliseconds (default 5000).
-            seed: Random seed for deterministic value generation (default 42).
-        """
-        self.instance = instance
         self.dialect = dialect
         self.timeout_ms = timeout_ms
         self._rng = random.Random(seed)
 
+    # ── Public API ──────────────────────────────────────────────
+
     def solve(self, constraint: SolverConstraint) -> SolveResult:
-        """Satisfy constraints using domain-based CSP solving + SMT fallback."""
+        """Satisfy *constraint* using domain + SMT solving.
 
-        tables = constraint.target_tables
-        outcome = constraint.target_outcome
+        Returns :class:`SolveResult` with ``sat=True`` and assignments
+        on success, or ``sat=False`` with a reason on failure.
+        """
+        if not constraint.constraints and not constraint.join_equalities:
+            return SolveResult(sat=True, assignments={})
 
-        # NULL targets: direct assignment.
-        if outcome == BranchType.ATOM_NULL and constraint.null_columns:
-            result: Dict[str, Dict[str, Any]] = {}
-            for null_col in constraint.null_columns:
-                if isinstance(null_col, exp.Column):
-                    table = _resolve_table(null_col, tables, self.instance)
-                    result.setdefault(table, {})[null_col.name] = None
-            validated = self._validate_and_complete(result)
-            if validated is not None:
-                return SolveResult(sat=True, assignments=validated)
-            return SolveResult(sat=False, reason="NULL target violates NOT NULL")
+        # Validate type annotations
+        ok, reason = self._validate_types(constraint)
+        if not ok:
+            return SolveResult(sat=False, reason=reason)
 
-        # --- Domain Solver (CSP-lite with Union-Find) ---
-        from .value_space import DomainSolver
-        from .lowering import ColumnUnionFind
+        # Tier 1: Domain solver
+        domain_result = self._try_domain(constraint)
+        if domain_result.status == "sat":
+            return SolveResult(
+                sat=True,
+                assignments=self._remap_assignments(domain_result.assignments or {}, constraint.alias_map),
+            )
+        # For "unsat" from domain solver, still try SMT as fallback —
+        # the domain solver may incorrectly reject complex expressions
+        # (e.g., OR conditions) that the SMT solver can handle.
+        if domain_result.status not in ("unknown", "unsat"):
+            return SolveResult(
+                sat=False,
+                reason=domain_result.reason or f"unexpected_domain_status:{domain_result.status}",
+            )
 
-        ds = DomainSolver(self.instance, self.dialect)
-        fixed_values: Dict[str, Dict[str, Any]] = {}
-        predicates: List[Tuple[str, str, str, Any]] = []
-        equivalences = ColumnUnionFind()
-
-        # Extract from atom + path predicates using centralized lowering.
-        from .lowering import lower_predicates
-        all_exprs = [constraint.atom] + list(constraint.path_predicates)
-        for expr in all_exprs:
-            lowered, _ = lower_predicates(expr, self.instance, tables, constraint.alias_map or None)
-            for lp in lowered:
-                if lp.op == "=":
-                    fixed_values.setdefault(lp.table, {})[lp.column] = lp.value
-                else:
-                    predicates.append((lp.table, lp.column, lp.op, lp.value))
-
-        # JOIN equalities → Union-Find equivalences.
-        from .lowering import match_column as _mc
-        for lt, lc, rt, rc in constraint.join_equalities:
-            lt_real = self._resolve(lt)
-            rt_real = self._resolve(rt)
-            # Normalize column names to match Instance's canonical names.
-            lc_matched = _mc(self.instance, lt_real, lc) or lc
-            rc_matched = _mc(self.instance, rt_real, rc) or rc
-            equivalences.union(f"{lt_real}.{lc_matched}", f"{rt_real}.{rc_matched}")
-
-        # FK: use existing parent values.
-        for child_t, child_c, parent_t, parent_c in constraint.foreign_keys:
-            parent_rows = self.instance.get_rows(parent_t)
-            if parent_rows:
-                val = parent_rows[-1][parent_c].concrete
-                if val is not None:
-                    fixed_values.setdefault(child_t, {})[child_c] = val
-
-        result = ds.solve(
-            tables=tables,
-            fixed_values=fixed_values,
-            predicates=predicates,
-            equivalences=equivalences,
-            not_null=list(constraint.not_null_columns),
-            must_null=[],
-            avoid_values=dict(constraint.avoid_values),
-        )
-
-        if result is not None:
-            result = self._apply_join_equalities(result, constraint)
-            result = self._apply_fk_constraints(result, constraint)
-            validated = self._validate_and_complete(result)
-            if validated is not None:
-                return SolveResult(sat=True, assignments=validated)
-
-        # --- SMT fallback ---
-        smt_result = _try_smt(constraint, self.instance, self.dialect, self.timeout_ms)
+        # Tier 2: SMT solver
+        smt_result, smt_reason = self._try_smt(constraint)
         if smt_result is not None:
-            smt_result = self._apply_join_equalities(smt_result, constraint)
-            smt_result = self._apply_fk_constraints(smt_result, constraint)
-            validated = self._validate_and_complete(smt_result)
-            if validated is not None:
-                return SolveResult(sat=True, assignments=validated)
+            return SolveResult(sat=True, assignments=smt_result)
 
-        return SolveResult(sat=False, reason="all tiers exhausted")
+        return SolveResult(sat=False, reason=smt_reason)
 
+    # ── Validation ──────────────────────────────────────────────
 
-    def _apply_join_equalities(
-        self, result: Dict[str, Dict[str, Any]], constraint: SolverConstraint
-    ) -> Dict[str, Dict[str, Any]]:
-        """Propagate values across JOIN equalities.
+    def _validate_types(self, constraint: SolverConstraint) -> Tuple[bool, str]:
+        """Check that all Column nodes have type annotations."""
+        for expr in constraint.constraints:
+            for col in expr.find_all(exp.Column):
+                if col_type(col) is None:
+                    return False, f"Column {col.table or '?'}.{col.name} has no type annotation"
+        return True, ""
 
-        If the solver produced `{A: {id: 51}}` and there's a JOIN equality
-        `A.id = B.id`, propagate: `{A: {id: 51}, B: {id: 51}}`.
+    # ── Domain solver ───────────────────────────────────────────
+
+    def _try_domain(
+        self, constraint: SolverConstraint,
+    ):
+        """Attempt to solve with the domain solver (CSP-lite)."""
+        from .domain import DomainSolver
+
+        ds = DomainSolver()
+        return ds.solve(constraint)
+
+    def _remap_assignments(
+        self,
+        assignments: Dict[str, Any],
+        alias_map: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """Remap ``"table.col"`` keys: resolve aliases to physical names.
+
+        For self-joins where multiple aliases map to the same physical table,
+        keeps the alias key to avoid collisions.
         """
-        result = {k: dict(v) for k, v in result.items()}  # shallow copy
-        for left_table, left_col, right_table, right_col in constraint.join_equalities:
-            lt = self._resolve(left_table)
-            rt = self._resolve(right_table)
-            # Propagate left → right.
-            if lt in result and left_col in result[lt]:
-                result.setdefault(rt, {})[right_col] = result[lt][left_col]
-            # Propagate right → left.
-            elif rt in result and right_col in result[rt]:
-                result.setdefault(lt, {})[left_col] = result[rt][right_col]
-        return result
+        # Count how many aliases map to each physical table.
+        table_counts: Dict[str, int] = {}
+        for key in assignments:
+            table = key.split(".", 1)[0]
+            physical = alias_map.get(table, table)
+            table_counts[physical] = table_counts.get(physical, 0) + 1
 
-    def _apply_fk_constraints(
-        self, result: Dict[str, Dict[str, Any]], constraint: SolverConstraint
-    ) -> Dict[str, Dict[str, Any]]:
-        """Ensure FK columns reference existing parent rows.
+        remapped: Dict[str, Any] = {}
+        for key, value in assignments.items():
+            table, col = key.split(".", 1)
+            physical = alias_map.get(table, table)
+            # Use physical name if unique, alias if self-join.
+            result_table = physical if table_counts[physical] == 1 else table
+            remapped[f"{result_table}.{col}"] = value
+        return remapped
 
-        If the result has a child table row but no FK value, pick from
-        existing parent rows. If no parent rows exist, create one with
-        the same key value (coordinated).
-        """
-        result = {k: dict(v) for k, v in result.items()}
-        for child_table, child_col, parent_table, parent_col in constraint.foreign_keys:
-            if child_table not in result:
+    # ── SMT solver ──────────────────────────────────────────────
+
+    def _try_smt(
+        self, constraint: SolverConstraint,
+    ) -> Tuple[Optional[Dict[str, Dict[str, Any]]], str]:
+        """Solve all constraint expressions with Z3."""
+        try:
+            from .smt_solver import SMTSolver, UnsupportedSMTError
+
+            smt = SMTSolver(timeout_ms=self.timeout_ms)
+
+            # Narrow search space: STRFTIME('%Y', col) year comparisons
+            # imply tight bounds on col (epoch day/second for the year
+            # span). Without this, Z3 must invert the Hinnant year
+            # decomposition and frequently times out.
+            narrow_year_bounds(constraint)
+
+            # Declare variables from all columns in constraints.
+            for expr in constraint.constraints:
+                for col in expr.find_all(exp.Column):
+                    col_key = f"{normalize_name(col.table or '')}.{normalize_name(col.name)}"
+                    dtype = col_type(col) or DataType.build("TEXT")
+                    smt.declare_variable(col_key, dtype)
+
+            # Declare variables from join equalities.
+            declared_keys = set(smt.context.get("variable_to_z3", {}))
+            for lt, lc, rt, rc in constraint.join_equalities:
+                for table, col_name in [(lt, lc), (rt, rc)]:
+                    resolved_table = self._resolve_smt_table(constraint, declared_keys, table, col_name)
+                    if resolved_table is None:
+                        return None, "all tiers exhausted"
+                    key = f"{normalize_name(resolved_table)}.{normalize_name(col_name)}"
+                    if key not in smt.context.get("variable_to_z3", {}):
+                        dtype = self._find_col_type(constraint, resolved_table, col_name)
+                        smt.declare_variable(key, dtype)
+                    declared_keys.add(key)
+
+            # Translate and add all constraint expressions.
+            # Skip constraints that fail translation instead of aborting —
+            # the remaining constraints may still produce a valid assignment.
+            skipped = 0
+            for expr in constraint.constraints:
+                try:
+                    z3_expr = smt.translate(expr)
+                except (UnsupportedSMTError, Exception):
+                    skipped += 1
+                    continue
+                if z3_expr is None:
+                    skipped += 1
+                    continue
+                smt.add(z3_expr)
+
+            # Add join equalities as Z3 equalities.
+            for lt, lc, rt, rc in constraint.join_equalities:
+                try:
+                    left_table = self._resolve_smt_table(constraint, declared_keys, lt, lc)
+                    right_table = self._resolve_smt_table(constraint, declared_keys, rt, rc)
+                    if left_table is None or right_table is None:
+                        return None, "all tiers exhausted"
+                    left_key = f"{normalize_name(left_table)}.{normalize_name(lc)}"
+                    right_key = f"{normalize_name(right_table)}.{normalize_name(rc)}"
+                    left_z3 = smt.context.get("variable_to_z3", {}).get(left_key)
+                    right_z3 = smt.context.get("variable_to_z3", {}).get(right_key)
+                    if left_z3 is None or right_z3 is None:
+                        return None, "all tiers exhausted"
+                    smt.add_raw(left_z3 == right_z3)
+                except Exception:
+                    return None, "all tiers exhausted"
+
+            status, solutions = smt.solve()
+            if status != "sat" or not solutions:
+                return None, "all tiers exhausted"
+
+            # Return flat "table.col" → value dict.
+            alias_map = constraint.alias_map or {}
+            assignments: Dict[str, Any] = {}
+            for var_name, value in solutions.items():
+                assignments[var_name] = value
+            if not assignments:
+                return None, "all tiers exhausted"
+            return self._remap_assignments(assignments, alias_map), ""
+        except Exception:
+            return None, "all tiers exhausted"
+
+    def _resolve_smt_table(
+        self,
+        constraint: SolverConstraint,
+        declared_keys: set[str],
+        table: str,
+        col_name: str,
+    ) -> Optional[str]:
+        """Resolve a join-side table name into the SMT variable namespace."""
+        table_norm = normalize_name(table)
+        col_norm = normalize_name(col_name)
+        exact_key = f"{table_norm}.{col_norm}"
+        if exact_key in declared_keys:
+            return table_norm
+
+        alias_map = constraint.alias_map or {}
+        candidates: List[str] = []
+        for key in declared_keys:
+            if "." not in key:
                 continue
-            if child_col in result[child_table] and result[child_table][child_col] is not None:
-                # FK value already set (e.g., from JOIN equality propagation).
-                # Ensure the parent has this value.
-                fk_value = result[child_table][child_col]
-                parent_rows = self.instance.get_rows(parent_table)
-                parent_has_value = any(
-                    row[parent_col].concrete == fk_value for row in parent_rows
-                )
-                if not parent_has_value:
-                    # Need to create a parent row with this key.
-                    result.setdefault(parent_table, {})[parent_col] = fk_value
-            else:
-                # No FK value set — pick from existing parent rows.
-                parent_rows = self.instance.get_rows(parent_table)
-                if parent_rows:
-                    result[child_table][child_col] = parent_rows[-1][parent_col].concrete
-                else:
-                    # No parent exists — create one. Use a generated value.
-                    profile = _column_profile(self.instance, parent_table, parent_col)
-                    value = _default_for_family(profile) if profile else 1
-                    result.setdefault(parent_table, {})[parent_col] = value
-                    result[child_table][child_col] = value
-        return result
-
-    def _resolve(self, table_name: str) -> str:
-        """Resolve alias to real table name."""
-        from parseval.helper import normalize_name
-        real = normalize_name(table_name)
-        if real in self.instance.tables:
-            return real
-        return table_name
-
-    def _validate_and_complete(
-        self, raw: Dict[str, Dict[str, Any]]
-    ) -> Optional[Dict[str, Dict[str, Any]]]:
-        """Validate assignments against schema constraints and coerce values.
-
-        Uses the domain module's :func:`coerce_value` to ensure every
-        generated value matches the column's declared type. Also fills FK
-        columns from existing parent rows to maintain referential integrity.
-        Returns None if the assignment violates an unresolvable constraint.
-        """
-        completed: Dict[str, Dict[str, Any]] = {}
-        for table_name, col_values in raw.items():
-            if table_name not in self.instance.tables:
+            key_table, key_col = key.split(".", 1)
+            if key_col != col_norm:
                 continue
-            row: Dict[str, Any] = {}
-            for col_name, col_type in self.instance.tables[table_name].items():
-                if col_name in col_values:
-                    value = col_values[col_name]
-                    # Validate NOT NULL.
-                    if value is None and not self.instance.nullable(table_name, col_name):
-                        return None
-                    # Coerce through the domain adapter for type safety.
-                    # For SQLite, preserve string datetime values as-is (SQLite stores them as TEXT).
-                    if value is not None:
-                        try:
-                            datatype = DataType.build(col_type)
-                            if self.dialect == "sqlite" and isinstance(value, str) and datatype.is_type(*DataType.TEMPORAL_TYPES):
-                                pass  # Keep original string format for SQLite
-                            else:
-                                value = coerce_value(value, datatype, dialect=self.dialect)
-                        except Exception:
-                            pass
-                    row[col_name] = value
-            completed[table_name] = row
-        return completed
+            if key_table == table_norm:
+                return key_table
+            physical = normalize_name(alias_map.get(key_table, key_table))
+            if physical == table_norm:
+                candidates.append(key_table)
 
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            return None
 
-__all__ = ["Solver", "SolveResult"]
+        target_candidates: List[str] = []
+        for target in constraint.target_tables:
+            target_norm = normalize_name(target)
+            if target_norm == table_norm:
+                return target_norm
+            if normalize_name(alias_map.get(target_norm, target_norm)) == table_norm:
+                target_candidates.append(target_norm)
+
+        if len(target_candidates) == 1:
+            return target_candidates[0]
+        if target_candidates:
+            return None
+
+        return table_norm
+
+    def _find_col_type(
+        self, constraint: SolverConstraint, table: str, col_name: str
+    ) -> DataType:
+        """Find the DataType for a column from the constraint expressions."""
+        table_norm = normalize_name(table)
+        col_norm = normalize_name(col_name)
+        for expr in constraint.constraints:
+            for col in expr.find_all(exp.Column):
+                if (
+                    normalize_name(col.table or "") == table_norm
+                    and normalize_name(col.name) == col_norm
+                ):
+                    dtype = col_type(col)
+                    if dtype is not None:
+                        return dtype
+        return DataType.build("TEXT")
+
+__all__ = ["Solver", "SolveResult", "SolverConstraint"]

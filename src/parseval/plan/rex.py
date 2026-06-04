@@ -60,6 +60,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import date, datetime
+from decimal import Decimal
 from functools import wraps
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
 
@@ -68,18 +69,41 @@ from sqlglot import exp, generator
 from sqlglot.executor.env import ENV as _SQLGLOT_ENV
 from sqlglot.optimizer.simplify import simplify
 
+import functools
+
 from parseval.dtype import DataType
 from parseval.helper import like_to_pattern, normalize_name
 
 # Re-export AST-extension predicates and runtime containers from their homes
 # so callers can still import them as ``parseval.plan.rex.Is_Null`` / etc.
-from .ast_ext import Is_Not_Null, Is_Null  # noqa: F401
+
 from .context import AggGroup, Row  # noqa: F401
 
 
 # =============================================================================
 # Symbol hierarchy
 # =============================================================================
+
+
+
+class Is_Null(exp.Unary, exp.Predicate):
+    """``<expr> IS NULL`` predicate.
+
+    sqlglot parses ``IS NULL`` as ``exp.Is(this=<expr>, expression=exp.Null())``.
+    ParSEval uses a dedicated class so the evaluator / extractor can
+    dispatch on a single concept (rather than pattern-matching the
+    generic ``exp.Is`` node) for the two common NULL predicates.
+    """
+
+    def sql(self, dialect=None, **opts):
+        return f"{self.this.sql(dialect=dialect, **opts)} IS NULL"
+
+
+class Is_Not_Null(exp.Unary, exp.Predicate):
+    """``<expr> IS NOT NULL`` predicate; see :class:`Is_Null`."""
+
+    def sql(self, dialect=None, **opts):
+        return f"{self.this.sql(dialect=dialect, **opts)} IS NOT NULL"
 
 
 class Symbol(exp.Expression):
@@ -518,10 +542,21 @@ def _parse_temporal(value: Any) -> Optional[Union[date, datetime]]:
         return value
     if isinstance(value, str):
         try:
-            return date_parser.parse(value)
+            parsed = date_parser.parse(value)
+            if re.fullmatch(r"\s*\d{4}-\d{1,2}-\d{1,2}\s*", value):
+                return parsed.date()
+            return parsed
         except (ValueError, OverflowError, TypeError):
             return None
     return None
+
+
+def _align_temporal_precision(left: Any, right: Any) -> Tuple[Any, Any]:
+    if isinstance(left, datetime) and isinstance(right, date) and not isinstance(right, datetime):
+        return left, datetime(right.year, right.month, right.day)
+    if isinstance(right, datetime) and isinstance(left, date) and not isinstance(left, datetime):
+        return datetime(left.year, left.month, left.day), right
+    return left, right
 
 
 def _coerce_temporal_pair(left: Any, right: Any) -> Tuple[Any, Any]:
@@ -538,11 +573,22 @@ def _coerce_temporal_pair(left: Any, right: Any) -> Tuple[Any, Any]:
         parsed = _parse_temporal(left)
         if parsed is not None:
             return parsed, right
-    return left, right
+    return _align_temporal_precision(left, right)
 
 
 def _coerce_numeric_pair(left: Any, right: Any) -> Tuple[Any, Any]:
     """Align numeric-ish operands. Strings get parsed into numbers if safely possible."""
+    if isinstance(left, Decimal) and isinstance(right, float):
+        left = float(left)
+    if isinstance(right, Decimal) and isinstance(left, float):
+        right = float(right)
+    if isinstance(left, str) and isinstance(right, str):
+        try:
+            if "." in left or "." in right:
+                return float(left.strip()), float(right.strip())
+            return int(left.strip()), int(right.strip())
+        except (ValueError, TypeError):
+            return left, right
 
     def _coerce_str(value: Any, other: Any) -> Any:
         if not isinstance(value, str) or isinstance(other, bool):
@@ -592,7 +638,7 @@ def _coerce_value(
             return int(value)
         if isinstance(value, int):
             return value
-        if isinstance(value, float):
+        if isinstance(value, (float, Decimal)):
             try:
                 return int(value)
             except (OverflowError, ValueError):
@@ -610,7 +656,7 @@ def _coerce_value(
     if to_type.is_type(*DataType.REAL_TYPES):
         if isinstance(value, bool):
             return float(int(value))
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float, Decimal)):
             return float(value)
         if isinstance(value, str):
             try:
@@ -761,7 +807,14 @@ def _eval_sub(node: exp.Sub, env: Environment) -> Any:
     l, r = _eval(node.left, env), _eval(node.right, env)
     if l is None or r is None:
         return None
-    return l - r
+    try:
+        return l - r
+    except TypeError:
+        l, r = _coerce_numeric_pair(l, r)
+        try:
+            return l - r
+        except TypeError:
+            return None
 
 
 @handler(exp.Mul)
@@ -777,7 +830,14 @@ def _eval_div(node: exp.Div, env: Environment) -> Any:
     l, r = _eval(node.left, env), _eval(node.right, env)
     if l is None or r is None or r == 0:
         return None
-    return l / r
+    try:
+        return l / r
+    except TypeError:
+        l, r = _coerce_numeric_pair(l, r)
+        try:
+            return l / r
+        except TypeError:
+            return None
 
 
 @handler(exp.Mod)
@@ -873,6 +933,19 @@ def _eval_is_not_null_class(node: Is_Not_Null, env: Environment) -> bool:
 
 @handler(exp.Case)
 def _eval_case(node: exp.Case, env: Environment) -> Any:
+    case_operand = node.this
+    if case_operand is not None:
+        operand_value = _eval(case_operand, env)
+        for branch in node.args.get("ifs", []) or []:
+            candidate = _eval(branch.this, env)
+            if operand_value is None or candidate is None:
+                continue
+            left, right = _coerce_comparable(operand_value, candidate)
+            if left == right:
+                return _eval(branch.args.get("true"), env)
+        default = node.args.get("default")
+        return _eval(default, env) if default is not None else None
+
     for branch in node.args.get("ifs", []) or []:
         condition = _eval(branch.this, env)
         if condition is True:
@@ -923,6 +996,9 @@ def _eval_between(node: exp.Between, env: Environment) -> Optional[bool]:
     high = _eval(node.args.get("high"), env)
     if value is None or low is None or high is None:
         return None
+    value, low = _coerce_comparable(value, low)
+    value, high = _coerce_comparable(value, high)
+    low, high = _coerce_comparable(low, high)
     try:
         return low <= value <= high
     except TypeError:
@@ -959,15 +1035,21 @@ def _eval_ilike(node: exp.ILike, env: Environment) -> Optional[bool]:
     return _like(_eval(node.this, env), _eval(node.expression, env), case_insensitive=True)
 
 
+@functools.lru_cache(maxsize=256)
+def _cached_like_pattern(pattern: str, case_insensitive: bool):
+    """Cache compiled LIKE patterns — they're fixed per AST node."""
+    compiled = like_to_pattern(pattern)
+    if case_insensitive:
+        return re.compile(compiled.pattern, re.IGNORECASE)
+    return compiled
+
+
 def _like(value: Any, pattern: Any, *, case_insensitive: bool) -> Optional[bool]:
     if value is None or pattern is None:
         return None
     try:
-        compiled = like_to_pattern(str(pattern))
-        text = str(value)
-        if case_insensitive:
-            text = text.lower()
-        return bool(compiled.match(text))
+        compiled = _cached_like_pattern(str(pattern), case_insensitive)
+        return bool(compiled.match(str(value)))
     except re.error:  # pragma: no cover - defensive
         return False
 
@@ -1065,6 +1147,14 @@ def _eval_cast(node: exp.Cast, env: Environment) -> Any:
     strict = isinstance(node, exp.Cast)
     dialect = "postgres" if strict else "sqlite"
     return _coerce_value(value, None, target_dt, dialect=dialect)
+
+
+@handler(exp.TsOrDsToTimestamp)
+def _eval_ts_or_ds_to_timestamp(node: exp.TsOrDsToTimestamp, env: Environment) -> Any:
+    parsed = _parse_temporal(_eval(node.this, env))
+    if isinstance(parsed, date) and not isinstance(parsed, datetime):
+        return datetime(parsed.year, parsed.month, parsed.day)
+    return parsed
 
 
 # ----- ordered (pass-through used inside ORDER BY) -----
@@ -1177,9 +1267,15 @@ _ANONYMOUS_HANDLERS = {
 def _eval_time_to_str(node: exp.TimeToStr, env: Environment) -> Any:
     value = _eval(node.this, env)
     fmt = node.args.get("format")
+    if value is None and isinstance(node.this, (exp.Cast, exp.TsOrDsToTimestamp)):
+        inner = node.this.this
+        if isinstance(inner, exp.Literal) and str(inner.this).lower() == "now":
+            value = datetime.utcnow()
     if value is None or fmt is None:
         return None
-    fmt_str = str(fmt) if not isinstance(fmt, str) else fmt
+    fmt_str = fmt if isinstance(fmt, str) else _eval(fmt, env)
+    if fmt_str is None:
+        return None
     d = _parse_temporal(value) if isinstance(value, str) else value
     if d is None:
         d = _parse_temporal(str(value))
@@ -1230,6 +1326,34 @@ def negate_predicate(expr: exp.Expression) -> exp.Expression:
     if expr.key == "is_not_null":
         return Is_Null(this=expr.this)
     return simplify(expr.not_())
+
+
+# =============================================================================
+# Column metadata (schema hints stamped on exp.Column nodes)
+# =============================================================================
+
+
+def column_meta(col: exp.Column) -> Optional[dict]:
+    """Read schema hints stamped on a Column by :meth:`Plan._annotate`.
+
+    Returns a dict with keys ``table``, ``nullable``, ``unique``, ``domain``
+    (a :class:`DataType`), or ``None`` if the column was not enriched.
+    """
+    raw = col.args.get("_parseval_meta")
+    if raw is None:
+        return None
+    # Stored as a frozenset of (key, value) pairs for hashability.
+    return dict(raw)
+
+
+def set_column_meta(col: exp.Column, meta: dict) -> None:
+    """Stamp schema hints onto a Column node.
+
+    Internally stored as a frozenset of ``(key, value)`` pairs so the
+    Column remains hashable (required by sqlglot's ``simplify`` and other
+    passes that hash expression nodes).
+    """
+    col.set("_parseval_meta", frozenset(meta.items()))
 
 
 # =============================================================================
@@ -1291,4 +1415,6 @@ __all__ = [
     "DataType",
     # Utilities
     "negate_predicate",
+    "column_meta",
+    "set_column_meta",
 ]
